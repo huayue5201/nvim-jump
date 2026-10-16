@@ -67,6 +67,28 @@ local function available_labels(lines, matches)
   return avail
 end
 
+-- Width (in screen cells) of inline virtual text anchored at the exact byte
+-- position `col` on `line`, across all namespaces. Inline virtual text is drawn
+-- before the character it is anchored to, shifting that character to the right
+-- by this width. `virt_text_pos = "overlay"` does not account for it, so a label
+-- anchored there would land on the inline text instead of the matched character.
+local function inline_offset(buf, line, col)
+  local offset = 0
+  local marks = api.nvim_buf_get_extmarks(buf, -1, { line, col }, { line, col }, { details = true })
+
+  for _, mark in ipairs(marks) do
+    local details = mark[4]
+
+    if details.virt_text_pos == 'inline' and details.virt_text then
+      for _, chunk in ipairs(details.virt_text) do
+        offset = offset + fn.strdisplaywidth(chunk[1])
+      end
+    end
+  end
+
+  return offset
+end
+
 function M.start()
   local win = api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
@@ -79,8 +101,6 @@ function M.start()
   local active = {}
 
   while true do
-    api.nvim_echo({ { '/' .. chars, '' } }, false, {})
-
     local char = fn.getcharstr(-1)
     local jump_to = active[char]
 
@@ -142,11 +162,22 @@ function M.start()
 
         if label then
           active[label] = { match.line + 1, match.start_col }
-          api.nvim_buf_set_extmark(buf, NS, match.line, match.start_col, {
+
+          local offset = inline_offset(buf, match.line, match.start_col)
+          local opts = {
             virt_text = { { label, CONFIG.label } },
-            virt_text_pos = 'overlay',
             priority = 201,
-          })
+          }
+
+          -- Shift the label past any inline virtual text anchored at the
+          -- match, otherwise it covers that text instead of the character.
+          if offset > 0 then
+            opts.virt_text_win_col = match.start_col + offset
+          else
+            opts.virt_text_pos = 'overlay'
+          end
+
+          api.nvim_buf_set_extmark(buf, NS, match.line, match.start_col, opts)
         end
       end
     end
@@ -155,7 +186,6 @@ function M.start()
   end
 
   api.nvim_buf_clear_namespace(buf, NS, 0, -1)
-  api.nvim_echo({ { '', '' } }, false, {})
   vim.cmd.redraw()
 end
 
