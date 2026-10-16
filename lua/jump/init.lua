@@ -67,14 +67,22 @@ local function available_labels(lines, matches)
   return avail
 end
 
--- Width (in screen cells) of inline virtual text anchored at the exact byte
--- position `col` on `line`, across all namespaces. Inline virtual text is drawn
--- before the character it is anchored to, shifting that character to the right
--- by this width. `virt_text_pos = "overlay"` does not account for it, so a label
--- anchored there would land on the inline text instead of the matched character.
+-- Width (in screen cells) of inline virtual text anchored at byte positions
+-- `0..col` on `line`, across all namespaces. Inline virtual text is drawn
+-- before the character it is anchored to, shifting everything after it to the
+-- right by its width. `virt_text_pos = "overlay"` does not account for any of
+-- this, so a label that switches to `virt_text_win_col` must add the total width
+-- of *every* inline hint at or before `col` (not just one anchored exactly at
+-- `col`), otherwise the label lands to the left of the matched character.
 local function inline_offset(buf, line, col)
   local offset = 0
-  local marks = api.nvim_buf_get_extmarks(buf, -1, { line, col }, { line, col }, { details = true })
+  local marks = api.nvim_buf_get_extmarks(
+    buf,
+    -1,
+    { line, 0 },
+    { line, col },
+    { details = true }
+  )
 
   for _, mark in ipairs(marks) do
     local details = mark[4]
@@ -169,8 +177,8 @@ function M.start()
             priority = 201,
           }
 
-          -- Shift the label past any inline virtual text anchored at the
-          -- match, otherwise it covers that text instead of the character.
+          -- Shift the label past any inline virtual text anchored at or
+          -- before the match, otherwise it lands left of the character.
           if offset > 0 then
             opts.virt_text_win_col = match.start_col + offset
           else
