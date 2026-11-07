@@ -49,10 +49,10 @@ and I now deem it stable enough to share it as a standalone plugin.
   capitals
 - CJK characters match by their pinyin initial: `nh` jumps to 你好,
   `sj` jumps to 世界
+- Optionally jump to matches in any window of the current tab page
 - Small codebase so less likely to be riddled with bugs
 
-Feature-wise this plugin is considered complete and extra features (e.g. jumping
-between windows) won't be added.
+Feature-wise this plugin is considered complete.
 
 ## Requirements
 
@@ -88,6 +88,10 @@ The following settings are available (along with their defaults):
 
   -- The highlight group to use for labels.
   label = 'FlashLabel',
+
+  -- Jump to matches in every window of the current tab page instead of only the
+  -- current window.
+  multi_window = false,
 }
 ```
 
@@ -121,6 +125,20 @@ text.
 A single letter can match many characters, so there may be more matches than
 labels. Keep typing to narrow them down; matches without a label are still
 highlighted, they just cannot be jumped to directly.
+
+### Multiple windows
+
+By default only the current window is searched. Enable `multi_window` to search
+every window of the current tab page; each match gets a label, and picking one
+switches to its window:
+
+```lua
+require('jump').setup({ multi_window = true })
+```
+
+Floating windows (hover, completion popups, …) are skipped, and other tab pages
+are not searched because their labels would not be visible. If the same buffer
+is shown in several windows, each visible part is searched independently.
 
 ## License
 

@@ -17,6 +17,10 @@ local CONFIG = {
 
   -- The highlight group to use for labels.
   label = 'FlashLabel',
+
+  -- Jump to matches in every window of the current tab page instead of only
+  -- the current window. Floating windows (popups, hover, …) are never included.
+  multi_window = false,
 }
 
 -- Byte length of the UTF-8 character starting at the 1-based byte index `i`.
@@ -136,7 +140,57 @@ local function parse_line(line)
   return chars
 end
 
-local function search(pattern, parsed, start_line, matches)
+-- The windows that take part in a jump: the current one, or (with
+-- `multi_window`) every non-floating window of the current tab page.
+local function target_windows(cur_win)
+  if not CONFIG.multi_window then
+    return { cur_win }
+  end
+
+  local wins = {}
+
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    -- The current window is always searched, even if it is floating.
+    if win == cur_win or api.nvim_win_get_config(win).relative == '' then
+      wins[#wins + 1] = win
+    end
+  end
+
+  return wins
+end
+
+-- Snapshot one window: its visible lines and their parsed keys. The text does
+-- not change while we are jumping, so parsing it only once is enough.
+local function window_panel(win)
+  local buf = api.nvim_win_get_buf(win)
+  local info = fn.getwininfo(win)[1]
+  local top = info.topline
+  local bot = info.botline
+  local lines = api.nvim_buf_get_lines(buf, top - 1, bot, true)
+  local parsed = {}
+
+  for idx, line in ipairs(lines) do
+    parsed[idx] = parse_line(line)
+  end
+
+  return { win = win, buf = buf, top = top, lines = lines, parsed = parsed }
+end
+
+local function clear_panels(panels)
+  for _, panel in ipairs(panels) do
+    api.nvim_buf_clear_namespace(panel.buf, NS, 0, -1)
+  end
+end
+
+-- Mark the old position in the jumplist, then switch to the window holding the
+-- match (if it is not the current one) and move the cursor there.
+local function jump(target)
+  vim.cmd("normal! m'")
+  api.nvim_set_current_win(target.win)
+  api.nvim_win_set_cursor(target.win, target.pos)
+end
+
+local function search(pattern, panels, matches)
   local sensitive = pattern ~= pattern:lower()
   local pchars = char_list(pattern)
   local plen = #pchars
@@ -145,32 +199,38 @@ local function search(pattern, parsed, start_line, matches)
     return
   end
 
-  for idx, chars in ipairs(parsed) do
-    local lnum = start_line + idx - 1
+  for _, panel in ipairs(panels) do
+    for idx, chars in ipairs(panel.parsed) do
+      local lnum = panel.top + idx - 1
 
-    for i = 1, #chars - plen + 1 do
-      local hit = true
+      for i = 1, #chars - plen + 1 do
+        local hit = true
 
-      for j = 1, plen do
-        if not key_hit(chars[i + j - 1], pchars[j], sensitive) then
-          hit = false
-          break
+        for j = 1, plen do
+          if not key_hit(chars[i + j - 1], pchars[j], sensitive) then
+            hit = false
+            break
+          end
         end
-      end
 
-      if hit then
-        local first = chars[i]
-        local last = chars[i + plen - 1]
-        local next_char = chars[i + plen]
+        if hit then
+          local first = chars[i]
+          local last = chars[i + plen - 1]
+          local next_char = chars[i + plen]
 
-        matches[#matches + 1] = {
-          line = lnum - 1,
-          start_col = first.start,
-          end_col = last.stop,
-          line_index = idx,
-          next_lit = next_char and next_char.lit or nil,
-          next_py = next_char and next_char.py or nil,
-        }
+          matches[#matches + 1] = {
+            line = lnum - 1,
+            start_col = first.start,
+            end_col = last.stop,
+            -- Cached because matches from different windows may have different
+            -- text, and to avoid fetching the line again for the label.
+            text = panel.lines[idx],
+            win = panel.win,
+            buf = panel.buf,
+            next_lit = next_char and next_char.lit or nil,
+            next_py = next_char and next_char.py or nil,
+          }
+        end
       end
     end
   end
@@ -245,18 +305,11 @@ local function wait_for_char()
 end
 
 function M.start()
-  local win = api.nvim_get_current_win()
-  local buf = api.nvim_win_get_buf(win)
-  local info = fn.getwininfo(win)[1]
-  local top = info.topline
-  local bot = info.botline
-  local lines = api.nvim_buf_get_lines(buf, top - 1, bot, true)
-  local parsed = {}
+  local panels = {}
 
-  -- Parse the window's lines once: matching only compares keys afterwards, and
-  -- the text does not change while we are jumping.
-  for idx, line in ipairs(lines) do
-    parsed[idx] = parse_line(line)
+  -- Parse every participating window's lines once.
+  for _, win in ipairs(target_windows(api.nvim_get_current_win())) do
+    panels[#panels + 1] = window_panel(win)
   end
 
   local chars = ''
@@ -284,8 +337,7 @@ function M.start()
       end
 
       if jump_to then
-        vim.cmd("normal! m'")
-        api.nvim_win_set_cursor(win, jump_to)
+        jump(jump_to)
       end
 
       break
@@ -294,8 +346,7 @@ function M.start()
       -- character (e.g. a CJK one) is split into invalid UTF-8.
       chars = fn.strcharpart(chars, 0, math.max(fn.strchars(chars) - 1, 0))
     elseif jump_to then
-      vim.cmd("normal! m'")
-      api.nvim_win_set_cursor(win, jump_to)
+      jump(jump_to)
       break
     else
       chars = chars .. char
@@ -303,10 +354,10 @@ function M.start()
 
     matches = {}
     active = {}
-    api.nvim_buf_clear_namespace(buf, NS, 0, -1)
+    clear_panels(panels)
 
     if #chars > 0 then
-      search(chars, parsed, top, matches)
+      search(chars, panels, matches)
 
       local avail = available_labels(matches)
 
@@ -322,7 +373,7 @@ function M.start()
         end
 
         vim.hl.range(
-          buf,
+          match.buf,
           NS,
           CONFIG.search,
           { match.line, match.start_col },
@@ -331,9 +382,12 @@ function M.start()
         )
 
         if label then
-          active[label] = { match.line + 1, match.start_col }
+          active[label] = {
+            win = match.win,
+            pos = { match.line + 1, match.start_col },
+          }
 
-          local offset = inline_offset(buf, match.line, match.start_col)
+          local offset = inline_offset(match.buf, match.line, match.start_col)
           local opts = {
             virt_text = { { label, CONFIG.label } },
             priority = 201,
@@ -345,14 +399,20 @@ function M.start()
             -- `virt_text_win_col` is a display column, not a byte offset, so
             -- convert the byte position to its display width (a CJK character
             -- is three bytes but two cells wide).
-            local prefix = lines[match.line_index]:sub(1, match.start_col)
+            local prefix = match.text:sub(1, match.start_col)
 
             opts.virt_text_win_col = fn.strdisplaywidth(prefix) + offset
           else
             opts.virt_text_pos = 'overlay'
           end
 
-          api.nvim_buf_set_extmark(buf, NS, match.line, match.start_col, opts)
+          api.nvim_buf_set_extmark(
+            match.buf,
+            NS,
+            match.line,
+            match.start_col,
+            opts
+          )
         end
       end
     end
@@ -361,7 +421,7 @@ function M.start()
     pcall(vim.cmd.redraw)
   end
 
-  api.nvim_buf_clear_namespace(buf, NS, 0, -1)
+  clear_panels(panels)
   pcall(vim.cmd.redraw)
 end
 
