@@ -92,6 +92,11 @@ The following settings are available (along with their defaults):
   -- Jump to matches in every window of the current tab page instead of only the
   -- current window.
   multi_window = false,
+
+  -- Character codecs, in order of registration. A codec either maps non-ASCII
+  -- characters to alternative ASCII keys (e.g. pinyin initials) or parses a
+  -- whole line for context-sensitive scripts; see lua/jump/codec/init.lua.
+  codecs = { 'pinyin' },
 }
 ```
 
@@ -117,7 +122,8 @@ jumping into Chinese text does not require switching to an IME:
 - Pinyin initials ignore case (`N` still matches 你); ASCII input with capitals
   is case-sensitive as usual
 
-The mapping covers the 3755 GB2312 level-1 characters, i.e. the common ones.
+The mapping covers the 3755 GB2312 level-1 characters plus the most common
+多音字, which get one initial per reading (行 `x`/`h`, 重 `z`/`c`, 长 `c`/`z`).
 Characters outside that set are matched literally only. The table lives in
 `lua/jump/pinyin.lua` and is only loaded once a buffer actually contains CJK
 text.
@@ -125,6 +131,44 @@ text.
 A single letter can match many characters, so there may be more matches than
 labels. Keep typing to narrow them down; matches without a label are still
 highlighted, they just cannot be jumped to directly.
+
+### Other scripts
+
+Non-ASCII matching is pluggable through codecs. A codec is a module returning
+`keys(char)` (alternative ASCII keys, e.g. a romanization), `parse(line, entries)`
+(for scripts whose characters depend on context, e.g. a small kana that changes
+the preceding one) and/or `normalize(str)` (compatibility folding of the input
+query). `lua/jump/codec/init.lua` documents the contract;
+`lua/jump/codec/pinyin.lua` is a short example.
+
+Codecs are loaded lazily by name from `jump.codec.<name>`, so one can also live
+in your own configuration as `lua/jump/codec/<name>.lua` on `runtimepath`. All
+enabled codecs run, in configuration order, so a kana codec and the pinyin codec
+can work on the same line:
+
+```lua
+require('jump').setup({ codecs = { 'pinyin', 'kana' } })
+```
+
+A character that no codec knows about is still matched literally.
+
+When several matches start at the same place, the longest one wins, and every
+character that would extend the query (rather than finish it) is kept away from
+the label keys. For example, with a codec whose key is `kya`, typing `ky` never
+lets `a` jump away.
+
+Queries are normalized to NFC before matching, so `e` followed by a combining
+acute accent matches `é`, marks are put into canonical order first, and Hangul
+jamo match the precomposed syllable. Buffer text is assumed to be NFC already
+(which is what editors and input methods write); text stored in another
+normalization form is matched as-is. Compatibility folding (NFKC: half-width
+katakana, compatibility ideographs) is left to codecs through `normalize`.
+
+One limitation of `parse`: the collected entries are matched one after another,
+so a line-level codec that fuses several characters into one entry can expose
+that entry through its ASCII `keys`, but typing the fused characters literally
+will not match it. Right-to-left scripts are not supported: labels are placed by
+byte column, which does not follow their visual order.
 
 ### Multiple windows
 

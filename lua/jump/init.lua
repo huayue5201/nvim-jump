@@ -1,6 +1,9 @@
 local fn = vim.fn
 local api = vim.api
 
+local text = require('jump.text')
+local codec = require('jump.codec')
+
 local M = {}
 local NS = api.nvim_create_namespace('jump')
 local CR = api.nvim_replace_termcodes('<Cr>', true, true, true)
@@ -21,123 +24,40 @@ local CONFIG = {
   -- Jump to matches in every window of the current tab page instead of only
   -- the current window. Floating windows (popups, hover, …) are never included.
   multi_window = false,
+
+  -- Character codecs, in order of registration. A codec maps non-ASCII
+  -- characters to alternative ASCII keys (e.g. pinyin initials); see
+  -- lua/jump/codec/init.lua. Add your own under lua/jump/codec/<name>.lua and
+  -- list it here.
+  codecs = { 'pinyin' },
 }
 
--- Byte length of the UTF-8 character starting at the 1-based byte index `i`.
-local function utf8_len(str, i)
-  local byte = str:byte(i)
-
-  if byte < 0x80 then
-    return 1
-  elseif byte < 0xE0 then
-    return 2
-  elseif byte < 0xF0 then
-    return 3
-  end
-
-  return 4
-end
-
--- Split a string into its UTF-8 characters.
-local function char_list(str)
-  local chars = {}
-  local i = 1
-
-  while i <= #str do
-    local len = utf8_len(str, i)
-
-    chars[#chars + 1] = str:sub(i, i + len - 1)
-    i = i + len
-  end
-
-  return chars
-end
-
-local PINYIN = nil
-
--- Character -> pinyin initials. Loaded lazily so buffers without CJK text
--- never pay for it.
-local function pinyin()
-  if PINYIN then
-    return PINYIN
-  end
-
-  local groups = require('jump.pinyin')
-  local map = {}
-
-  for letter, chars in pairs(groups) do
-    for _, char in ipairs(char_list(chars)) do
-      local cur = map[char]
-
-      if cur then
-        if not cur:find(letter, 1, true) then
-          map[char] = cur .. letter
-        end
-      else
-        map[char] = letter
-      end
-    end
-  end
-
-  PINYIN = map
-  return map
-end
-
--- Pinyin initials of `char`, or nil when it is not a CJK character we know.
-local function pinyin_key(char)
-  if char:byte() < 0x80 then
-    return nil
-  end
-
-  return pinyin()[char]
-end
-
--- Does the character `entry` match the input character `char`?
---
--- ASCII is matched literally (case-insensitively when the input has no
--- capitals), CJK characters match through their pinyin initials and can still
--- be matched by typing the character itself, everything else is literal.
-local function key_hit(entry, char, sensitive)
-  if entry.py then
-    if #char > 1 then
-      return entry.lit == char
-    end
-
-    -- Pinyin initials have no case, so they always match case-insensitively.
-    return entry.py:find(char:lower(), 1, true) ~= nil
-  end
-
-  if #entry.lit == 1 and entry.lit:byte() < 0x80 then
-    if sensitive then
-      return entry.lit == char
-    end
-
-    return entry.lit:lower() == char:lower()
-  end
-
-  return entry.lit == char
-end
-
--- Turn a line into its characters, remembering each one's byte range (0-based,
--- end exclusive), its literal text and its pinyin initials (if any).
-local function parse_line(line)
+-- Default line parser: one entry per character, with the keys supplied by the
+-- enabled codecs. A line-level codec can bypass this (see lua/jump/codec).
+local function default_parse_line(line)
   local chars = {}
   local i = 1
 
   while i <= #line do
-    local len = utf8_len(line, i)
+    local len = text.utf8_len(line, i)
     local char = line:sub(i, i + len - 1)
 
     chars[#chars + 1] = {
       start = i - 1,
       stop = i - 1 + len,
       lit = char,
-      py = pinyin_key(char),
+      keys = codec.keys(char),
     }
     i = i + len
   end
 
   return chars
+end
+
+-- Turn a line into its characters, remembering each one's byte range (0-based,
+-- end exclusive), its literal text and the alternative keys that may match it.
+local function parse_line(line)
+  return codec.parse(line, default_parse_line)
 end
 
 -- The windows that take part in a jump: the current one, or (with
@@ -190,12 +110,136 @@ local function jump(target)
   api.nvim_win_set_cursor(target.win, target.pos)
 end
 
+-- Match one of the entry's keys against the query starting at `qi`.
+--
+-- Keys are ASCII and always case-insensitive (pinyin and romanizations have no
+-- case). A key may be longer than what is left of the query: the query then
+-- ends in the middle of the key, which is a valid prefix match. Returns the
+-- number of query characters consumed, or nil.
+local function key_hit(key, pchars, qi)
+  local avail = #pchars - qi + 1
+
+  if avail <= 0 then
+    return nil
+  end
+
+  local n = math.min(avail, #key)
+
+  for j = 1, n do
+    local q = pchars[qi + j - 1]
+
+    if #q ~= 1 or q:lower() ~= key:sub(j, j) then
+      return nil
+    end
+  end
+
+  return n
+end
+
+-- Match the literal character (used when the input types the character itself).
+-- ASCII follows the query's case sensitivity, everything else is exact.
+local function literal_hit(entry, pchars, qi, sensitive)
+  local q = pchars[qi]
+
+  if not q then
+    return nil
+  end
+
+  if #entry.lit == 1 and entry.lit:byte() < 0x80 then
+    if sensitive then
+      return entry.lit == q and 1 or nil
+    end
+
+    return entry.lit:lower() == q:lower() and 1 or nil
+  end
+
+  return entry.lit == q and 1 or nil
+end
+
+-- Try to consume the whole query starting at `start`, walking forward through
+-- the parsed characters. Returns the index of the last consumed character and,
+-- when the query ended in the middle of one of its alternative keys, the set of
+-- characters that would extend one of these matches (nil otherwise). The set
+-- matters because those key presses extend the match rather than jump to a
+-- label. The longest completion wins: with multi-character keys a query can
+-- often be split in more than one way, and the user expects the widest span.
+-- Branches are kept in a stack instead of recursing: a long line would
+-- otherwise exceed Lua's C stack limit. Each state is expanded once, so
+-- ambiguous keys cannot make the search exponential.
+local function match_from(parsed, start, pchars, sensitive)
+  local pending = { { start, 1 } }
+  local seen = {}
+  local best = nil
+  local reserved = nil
+
+  while #pending > 0 do
+    local state = table.remove(pending)
+    local i = state[1]
+    local qi = state[2]
+    local rest = state[3]
+
+    if qi > #pchars then
+      local last = i - 1
+
+      if not best or last > best then
+        best = last
+        reserved = nil
+      end
+
+      if last == best and rest then
+        reserved = reserved or {}
+        reserved[rest:sub(1, 1):lower()] = true
+      end
+    else
+      local entry = parsed[i]
+
+      if entry then
+        local row = seen[i]
+
+        if not row then
+          row = {}
+          seen[i] = row
+        end
+
+        local key = qi .. ':' .. (rest or '')
+
+        if not row[key] then
+          row[key] = true
+
+          for _, alt in ipairs(entry.keys) do
+            local n = key_hit(alt, pchars, qi)
+
+            if n then
+              local left = alt:sub(n + 1)
+
+              pending[#pending + 1] = {
+                i + 1,
+                qi + n,
+                left ~= '' and left or nil,
+              }
+            end
+          end
+
+          local n = literal_hit(entry, pchars, qi, sensitive)
+
+          if n then
+            pending[#pending + 1] = { i + 1, qi + n }
+          end
+        end
+      end
+    end
+  end
+
+  return best, reserved
+end
+
 local function search(pattern, panels, matches)
   local sensitive = pattern ~= pattern:lower()
-  local pchars = char_list(pattern)
-  local plen = #pchars
+  -- Normalize before splitting: input methods may produce decomposed text, and
+  -- equivalent forms must compare equal (see lua/jump/unicode.lua).
+  local pchars = text.chars(codec.normalize(pattern))
 
-  if plen == 0 then
+  if #pchars == 0 then
     return
   end
 
@@ -203,32 +247,24 @@ local function search(pattern, panels, matches)
     for idx, chars in ipairs(panel.parsed) do
       local lnum = panel.top + idx - 1
 
-      for i = 1, #chars - plen + 1 do
-        local hit = true
+      for start = 1, #chars do
+        local last, reserved = match_from(chars, start, pchars, sensitive)
 
-        for j = 1, plen do
-          if not key_hit(chars[i + j - 1], pchars[j], sensitive) then
-            hit = false
-            break
-          end
-        end
-
-        if hit then
-          local first = chars[i]
-          local last = chars[i + plen - 1]
-          local next_char = chars[i + plen]
+        if last then
+          local first = chars[start]
+          local last_char = chars[last]
 
           matches[#matches + 1] = {
             line = lnum - 1,
             start_col = first.start,
-            end_col = last.stop,
+            end_col = last_char.stop,
             -- Cached because matches from different windows may have different
             -- text, and to avoid fetching the line again for the label.
             text = panel.lines[idx],
             win = panel.win,
             buf = panel.buf,
-            next_lit = next_char and next_char.lit or nil,
-            next_py = next_char and next_char.py or nil,
+            next = chars[last + 1],
+            reserved = reserved,
           }
         end
       end
@@ -243,16 +279,29 @@ local function available_labels(matches)
     avail[char] = true
   end
 
-  -- Disable all the labels that conflict with any of the characters that may be
-  -- matched by the next input. A CJK character may be reached through several
-  -- pinyin initials, so all of them are disabled.
+  -- Disable all the labels that conflict with a character the user may type
+  -- next: the first letter of every alternative key, and an ASCII literal.
+  -- A codec may give a character several keys (多音字), so all of them count.
   for _, match in ipairs(matches) do
-    if match.next_py then
-      for _, char in ipairs(char_list(match.next_py)) do
-        avail[char:lower()] = false
+    local next_entry = match.next
+
+    if next_entry then
+      for _, key in ipairs(next_entry.keys) do
+        avail[key:sub(1, 1):lower()] = false
       end
-    elseif match.next_lit then
-      avail[match.next_lit:lower()] = false
+
+      if #next_entry.lit == 1 and next_entry.lit:byte() < 0x80 then
+        avail[next_entry.lit:lower()] = false
+      end
+    end
+
+    -- The query may also have stopped in the middle of one or more
+    -- multi-character keys; those next characters would extend the match
+    -- instead of jumping to a label.
+    if match.reserved then
+      for char in pairs(match.reserved) do
+        avail[char] = false
+      end
     end
   end
 
@@ -268,13 +317,14 @@ end
 -- `col`), otherwise the label lands to the left of the matched character.
 local function inline_offset(buf, line, col)
   local offset = 0
-  -- The end position is exclusive, so `col + 1` also includes marks anchored
-  -- exactly at `col`.
+  -- Extmark regions are inclusive, so ending the range at `col` covers exactly
+  -- the hints anchored at or before the match start. Hints right after it only
+  -- shift later characters, not the label.
   local marks = api.nvim_buf_get_extmarks(
     buf,
     -1,
     { line, 0 },
-    { line, col + 1 },
+    { line, col },
     { details = true }
   )
 
@@ -313,7 +363,7 @@ function M.start()
   end
 
   local chars = ''
-  local matches = {}
+  local matches
   local active = {}
 
   while true do
@@ -328,8 +378,8 @@ function M.start()
     if char == ESC then
       break
     elseif char == CR then
-      for _, char in ipairs(LABELS) do
-        jump_to = active[char]
+      for _, label in ipairs(LABELS) do
+        jump_to = active[label]
 
         if jump_to then
           break
@@ -431,6 +481,12 @@ function M.setup(opts)
   end
 
   LABELS = fn.split(CONFIG.labels, '\\zs')
+
+  codec.reset()
+
+  for _, name in ipairs(CONFIG.codecs) do
+    codec.load(name)
+  end
 end
 
 M.setup()
