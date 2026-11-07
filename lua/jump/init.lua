@@ -19,36 +19,164 @@ local CONFIG = {
   label = 'FlashLabel',
 }
 
-local function search(pattern, lines, start_line, matches)
-  local lower = pattern == pattern:lower()
+-- Byte length of the UTF-8 character starting at the 1-based byte index `i`.
+local function utf8_len(str, i)
+  local byte = str:byte(i)
 
-  for idx, line in ipairs(lines) do
+  if byte < 0x80 then
+    return 1
+  elseif byte < 0xE0 then
+    return 2
+  elseif byte < 0xF0 then
+    return 3
+  end
+
+  return 4
+end
+
+-- Split a string into its UTF-8 characters.
+local function char_list(str)
+  local chars = {}
+  local i = 1
+
+  while i <= #str do
+    local len = utf8_len(str, i)
+
+    chars[#chars + 1] = str:sub(i, i + len - 1)
+    i = i + len
+  end
+
+  return chars
+end
+
+local PINYIN = nil
+
+-- Character -> pinyin initials. Loaded lazily so buffers without CJK text
+-- never pay for it.
+local function pinyin()
+  if PINYIN then
+    return PINYIN
+  end
+
+  local groups = require('jump.pinyin')
+  local map = {}
+
+  for letter, chars in pairs(groups) do
+    for _, char in ipairs(char_list(chars)) do
+      local cur = map[char]
+
+      if cur then
+        if not cur:find(letter, 1, true) then
+          map[char] = cur .. letter
+        end
+      else
+        map[char] = letter
+      end
+    end
+  end
+
+  PINYIN = map
+  return map
+end
+
+-- Pinyin initials of `char`, or nil when it is not a CJK character we know.
+local function pinyin_key(char)
+  if char:byte() < 0x80 then
+    return nil
+  end
+
+  return pinyin()[char]
+end
+
+-- Does the character `entry` match the input character `char`?
+--
+-- ASCII is matched literally (case-insensitively when the input has no
+-- capitals), CJK characters match through their pinyin initials and can still
+-- be matched by typing the character itself, everything else is literal.
+local function key_hit(entry, char, sensitive)
+  if entry.py then
+    if #char > 1 then
+      return entry.lit == char
+    end
+
+    -- Pinyin initials have no case, so they always match case-insensitively.
+    return entry.py:find(char:lower(), 1, true) ~= nil
+  end
+
+  if #entry.lit == 1 and entry.lit:byte() < 0x80 then
+    if sensitive then
+      return entry.lit == char
+    end
+
+    return entry.lit:lower() == char:lower()
+  end
+
+  return entry.lit == char
+end
+
+-- Turn a line into its characters, remembering each one's byte range (0-based,
+-- end exclusive), its literal text and its pinyin initials (if any).
+local function parse_line(line)
+  local chars = {}
+  local i = 1
+
+  while i <= #line do
+    local len = utf8_len(line, i)
+    local char = line:sub(i, i + len - 1)
+
+    chars[#chars + 1] = {
+      start = i - 1,
+      stop = i - 1 + len,
+      lit = char,
+      py = pinyin_key(char),
+    }
+    i = i + len
+  end
+
+  return chars
+end
+
+local function search(pattern, parsed, start_line, matches)
+  local sensitive = pattern ~= pattern:lower()
+  local pchars = char_list(pattern)
+  local plen = #pchars
+
+  if plen == 0 then
+    return
+  end
+
+  for idx, chars in ipairs(parsed) do
     local lnum = start_line + idx - 1
-    local line = lower and line:lower() or line
 
-    if #line > 0 then
-      local col = 1
+    for i = 1, #chars - plen + 1 do
+      local hit = true
 
-      while true do
-        local start, stop = line:find(pattern, col, true)
-
-        if not start then
+      for j = 1, plen do
+        if not key_hit(chars[i + j - 1], pchars[j], sensitive) then
+          hit = false
           break
         end
+      end
 
-        col = stop + 1
-        table.insert(matches, {
+      if hit then
+        local first = chars[i]
+        local last = chars[i + plen - 1]
+        local next_char = chars[i + plen]
+
+        matches[#matches + 1] = {
           line = lnum - 1,
-          start_col = start - 1,
-          end_col = stop,
+          start_col = first.start,
+          end_col = last.stop,
           line_index = idx,
-        })
+          next_lit = next_char and next_char.lit or nil,
+          next_py = next_char and next_char.py or nil,
+        }
       end
     end
   end
 end
 
-local function available_labels(lines, matches)
+local function available_labels(matches)
   local avail = {}
 
   for _, char in ipairs(LABELS) do
@@ -56,12 +184,16 @@ local function available_labels(lines, matches)
   end
 
   -- Disable all the labels that conflict with any of the characters that may be
-  -- matched by the next input.
+  -- matched by the next input. A CJK character may be reached through several
+  -- pinyin initials, so all of them are disabled.
   for _, match in ipairs(matches) do
-    local next_col = match.end_col + 1
-    local next_char = lines[match.line_index]:sub(next_col, next_col):lower()
-
-    avail[next_char] = false
+    if match.next_py then
+      for _, char in ipairs(char_list(match.next_py)) do
+        avail[char:lower()] = false
+      end
+    elseif match.next_lit then
+      avail[match.next_lit:lower()] = false
+    end
   end
 
   return avail
@@ -76,11 +208,13 @@ end
 -- `col`), otherwise the label lands to the left of the matched character.
 local function inline_offset(buf, line, col)
   local offset = 0
+  -- The end position is exclusive, so `col + 1` also includes marks anchored
+  -- exactly at `col`.
   local marks = api.nvim_buf_get_extmarks(
     buf,
     -1,
     { line, 0 },
-    { line, col },
+    { line, col + 1 },
     { details = true }
   )
 
@@ -97,6 +231,19 @@ local function inline_offset(buf, line, col)
   return offset
 end
 
+-- Async LSP errors (e.g. gopls cancelling an inlay hint request) are delivered
+-- while we are blocked waiting for input, and Neovim turns them into a Lua
+-- error that would abort the jump. Swallow them and keep waiting for a key.
+local function wait_for_char()
+  local ok, char = pcall(fn.getcharstr, -1)
+
+  if not ok then
+    return nil
+  end
+
+  return char
+end
+
 function M.start()
   local win = api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
@@ -104,12 +251,25 @@ function M.start()
   local top = info.topline
   local bot = info.botline
   local lines = api.nvim_buf_get_lines(buf, top - 1, bot, true)
+  local parsed = {}
+
+  -- Parse the window's lines once: matching only compares keys afterwards, and
+  -- the text does not change while we are jumping.
+  for idx, line in ipairs(lines) do
+    parsed[idx] = parse_line(line)
+  end
+
   local chars = ''
   local matches = {}
   local active = {}
 
   while true do
-    local char = fn.getcharstr(-1)
+    local char
+
+    repeat
+      char = wait_for_char()
+    until char ~= nil
+
     local jump_to = active[char]
 
     if char == ESC then
@@ -130,7 +290,9 @@ function M.start()
 
       break
     elseif char == BS or char == CTRL_H then
-      chars = chars:sub(1, #chars - 1)
+      -- Delete one character instead of one byte, otherwise a multi-byte
+      -- character (e.g. a CJK one) is split into invalid UTF-8.
+      chars = fn.strcharpart(chars, 0, math.max(fn.strchars(chars) - 1, 0))
     elseif jump_to then
       vim.cmd("normal! m'")
       api.nvim_win_set_cursor(win, jump_to)
@@ -144,9 +306,9 @@ function M.start()
     api.nvim_buf_clear_namespace(buf, NS, 0, -1)
 
     if #chars > 0 then
-      search(chars, lines, top, matches)
+      search(chars, parsed, top, matches)
 
-      local avail = available_labels(lines, matches)
+      local avail = available_labels(matches)
 
       for _, match in ipairs(matches) do
         local label = nil
@@ -180,7 +342,12 @@ function M.start()
           -- Shift the label past any inline virtual text anchored at or
           -- before the match, otherwise it lands left of the character.
           if offset > 0 then
-            opts.virt_text_win_col = match.start_col + offset
+            -- `virt_text_win_col` is a display column, not a byte offset, so
+            -- convert the byte position to its display width (a CJK character
+            -- is three bytes but two cells wide).
+            local prefix = lines[match.line_index]:sub(1, match.start_col)
+
+            opts.virt_text_win_col = fn.strdisplaywidth(prefix) + offset
           else
             opts.virt_text_pos = 'overlay'
           end
@@ -190,11 +357,12 @@ function M.start()
       end
     end
 
-    vim.cmd.redraw()
+    -- Redraw also pumps the event loop, so guard it the same way.
+    pcall(vim.cmd.redraw)
   end
 
   api.nvim_buf_clear_namespace(buf, NS, 0, -1)
-  vim.cmd.redraw()
+  pcall(vim.cmd.redraw)
 end
 
 function M.setup(opts)

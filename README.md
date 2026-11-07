@@ -47,6 +47,8 @@ and I now deem it stable enough to share it as a standalone plugin.
 - Reduce/correct input by pressing backspace
 - Case-insensitive if the input is lower case, case-sensitive if it includes
   capitals
+- CJK characters match by their pinyin initial: `nh` jumps to 你好,
+  `sj` jumps to 世界
 - Small codebase so less likely to be riddled with bugs
 
 Feature-wise this plugin is considered complete and extra features (e.g. jumping
@@ -99,6 +101,26 @@ require('jump').setup({
 
 The default highlight group for labels is `FlashLabel` so migrating from flash
 is easier.
+
+### Chinese (CJK) text
+
+CJK characters are matched both literally and by their pinyin initial, so
+jumping into Chinese text does not require switching to an IME:
+
+- `nh` matches 你好, `sj` matches 世界, `nhsj` matches 你好世界
+- ASCII is matched literally, so a query can mix both: `a你` or `abn`
+- Typing the character itself still works: `你` matches 你
+- Pinyin initials ignore case (`N` still matches 你); ASCII input with capitals
+  is case-sensitive as usual
+
+The mapping covers the 3755 GB2312 level-1 characters, i.e. the common ones.
+Characters outside that set are matched literally only. The table lives in
+`lua/jump/pinyin.lua` and is only loaded once a buffer actually contains CJK
+text.
+
+A single letter can match many characters, so there may be more matches than
+labels. Keep typing to narrow them down; matches without a label are still
+highlighted, they just cannot be jumped to directly.
 
 ## License
 
