@@ -1,0 +1,231 @@
+*jump.txt*   Jump to text with labels                  *jump* *nvim-jump*
+
+nvim-jump is a small jump plugin. Trigger it, type one or more characters to
+narrow the matches, then press a label to jump to that match. It is like `/`
+without having to press `n` repeatedly.
+
+This repository is the huayue5201/nvim-jump fork of
+yorickpeterse/nvim-jump. Compared to upstream it adds CJK matching by pinyin
+initial, optional multi-window jumping, a codec framework, Unicode (NFC)
+normalization of the query, and a headless test suite.
+
+==============================================================================
+CONTENTS                                                *jump-contents*
+
+  1. Features ....................................... |jump-features|
+  2. Requirements ............................... |jump-requirements|
+  3. Installation ................................... |jump-install|
+  4. Usage and mappings ............................. |jump-usage|
+  5. Setup and options .............................. |jump-setup|
+  6. Pinyin and CJK text ............................ |jump-pinyin|
+  7. Codecs ......................................... |jump-codecs|
+  8. Multiple windows ........................... |jump-multi-window|
+  9. Limitations ............................... |jump-limitations|
+ 10. Tests ........................................... |jump-tests|
+ 11. License ....................................... |jump-license|
+
+==============================================================================
+1. FEATURES                                             *jump-features*
+
+- Jump to arbitrary text without pressing `n` repeatedly.
+- Labels stay attached to the same match as much as possible while typing.
+- `Backspace` (or `CTRL-H`) removes the last input character.
+- Input that is entirely lower case matches case-insensitively; input that
+  contains a capital is matched case-sensitively.
+- CJK characters match by pinyin initial, e.g. `nh` for 你好.
+- Optionally jump to matches in every non-floating window of the current tab.
+- Small codebase: the jump loop and codec framework are a few hundred lines of
+  hand-written Lua, plus generated pinyin and Unicode tables.
+
+==============================================================================
+2. REQUIREMENTS                                     *jump-requirements*
+
+- Neovim 0.11.0 or newer. Earlier versions may work but are not supported.
+- The test suite needs Neovim 0.11 or newer as well.
+
+==============================================================================
+3. INSTALLATION                                        *jump-install*
+
+Install with your plugin manager. With lazy.nvim: >lua
+
+  {
+    'huayue5201/nvim-jump',
+    init = function()
+      vim.keymap.set({ 'n', 'x', 'o' }, 's', require('jump').start, {})
+    end,
+  }
+<
+Or install it however you prefer and create the mapping yourself: >lua
+
+  vim.keymap.set({ 'n', 'x', 'o' }, 's', require('jump').start, {})
+<
+The plugin calls `setup()` with the defaults when it is loaded, so no
+configuration is required.
+
+==============================================================================
+4. USAGE AND MAPPINGS                      *jump-usage* *jump-mappings*
+
+Call `require('jump').start` from a mapping. The mapping above covers normal,
+visual and operator-pending mode. While jumping:
+
+  <char>          Add a character to the query. Lower-case input matches
+                  case-insensitively; input with a capital is case-sensitive.
+  <BS> / <C-h>    Remove the last input character (one character, not byte).
+  <Enter>         Jump to the match that has the first available label.
+  <Esc>           Cancel the jump and remove all highlights/labels.
+  <label>         Jump to the match carrying that label.
+
+Labels are taken from the `labels` option in order of preference. Matches
+without a label are still highlighted but cannot be jumped to directly; type
+more input to narrow the matches.
+
+`start()` does not take arguments. It returns after jumping or cancelling.
+
+==============================================================================
+5. SETUP AND OPTIONS                     *jump-setup* *jump-options*
+
+The plugin runs `setup()` with the defaults at load time. Calling `setup()`
+merges the given table over the current configuration; pass only the options
+you want to change: >lua
+
+  require('jump').setup({
+    labels = 'abcdef',
+    multi_window = true,
+  })
+<
+Options and their defaults: >lua
+
+  {
+    -- The labels that may be used, in order of their preference.
+    labels = 'fdsaghjklrewqtyuiopvcxzbnm',
+
+    -- The highlight group to use for match highlights.
+    search = 'Search',
+
+    -- The highlight group to use for labels.
+    label = 'FlashLabel',
+
+    -- Jump to matches in every window of the current tab page instead of
+    -- only the current window. Floating windows are never included, except
+    -- the current window when it is floating.
+    multi_window = false,
+
+    -- Character codecs, in order of registration. A codec maps non-ASCII
+    -- characters to alternative ASCII keys (e.g. pinyin initials); see
+    -- |jump-codec-contract|. Add your own as lua/jump/codec/<name>.lua on
+    -- 'runtimepath' and list it here.
+    codecs = { 'pinyin' },
+  }
+<
+The default label highlight is `FlashLabel` to make migrating from flash
+easier. Colemak users can use: >lua
+
+  require('jump').setup({
+    labels = 'tnseriaogmplfuwyqbjdhvkzxc',
+  })
+<
+==============================================================================
+6. PINYIN AND CJK TEXT                    *jump-pinyin* *jump-cjk*
+
+CJK characters match both literally and by pinyin initial, so jumping into
+Chinese text does not require an IME:
+
+- `nh` matches 你好, `sj` matches 世界, `nhsj` matches 你好世界.
+- ASCII is matched literally, so a query can mix scripts: `a你` or `abn`.
+- Typing the character itself still works: `你` matches 你.
+- Pinyin initials ignore case (`N` still matches 你). ASCII input containing
+  capitals remains case-sensitive.
+- A character may have several initials (多音字): 行 `x`/`h`, 重 `z`/`c`,
+  长 `c`/`z`. All of its initials are valid keys.
+
+The table covers 3755 GB2312 level-1 characters plus common extra readings.
+The GB2312 groups live in `lua/jump/pinyin.lua`; the additional 多音字
+initials live in `lua/jump/codec/pinyin.lua`. The table is loaded lazily, only
+once a non-ASCII character is actually parsed.
+
+Characters outside the table are matched literally only. A single pinyin
+initial can match many characters, so there may be more matches than labels;
+keep typing to narrow them down.
+
+==============================================================================
+7. CODECS                              *jump-codecs* *jump-codec*
+
+Non-ASCII matching is pluggable. A codec is a Lua module named
+`jump.codec.<name>`, loaded lazily for each name in the `codecs` option. All
+enabled codecs run in configuration order. A character unknown to every codec
+is still matched literally. `lua/jump/codec/pinyin.lua` is a working example.
+
+                                                     *jump-codec-contract*
+A codec returns a table with any of these functions:
+
+  `keys(char)`                                         *jump-codec-keys*
+      Returns a list of alternative ASCII keys for `char`, or nil. Example:
+      `'你' -> { 'n' }`, `'き' -> { 'ki' }`. A character with several
+      readings may return several keys, e.g. `'行' -> { 'x', 'h' }`. Keys are
+      case-insensitive. Returning nil or `{}` means the character can only be
+      typed literally. Keys from all enabled codecs are merged.
+
+  `parse(line, entries)`                               *jump-codec-parse*
+      Optional line-level transform for context-sensitive scripts, e.g. small
+      Japanese kana modifying the preceding character. Receives the whole line
+      and the default entries (one per character) and returns a replacement
+      list of `{ start, stop, lit, keys }` entries, using 0-based byte offsets
+      with an exclusive `stop`. Return nil to leave the entries unchanged.
+      Line-level codecs run in configuration order, so several can cooperate.
+
+  `normalize(str)`                                   *jump-codec-normalize*
+      Optional compatibility folding of the whole input query, e.g.
+      half-width katakana to full-width. Return nil to leave it unchanged.
+      Canonical composition (NFC) is applied by jump itself afterwards, so a
+      codec only needs this for compatibility mappings.
+
+Codec errors during loading are reported as
+`jump: unable to load codec '<name>': ...`.
+
+==============================================================================
+8. MULTIPLE WINDOWS                               *jump-multi-window*
+
+By default only the current window is searched. With `multi_window = true`,
+every non-floating window of the current tab page is searched and each match
+gets a label. Picking a match switches to its window before moving the cursor,
+and the previous position is added to the jumplist.
+
+The current window is always searched, even if it is floating. Other floating
+windows (hover, completion popups, ...) are skipped. Other tab pages are not
+searched because their labels would not be visible. If one buffer is shown in
+several windows, each visible part is searched independently.
+
+==============================================================================
+9. LIMITATIONS                                     *jump-limitations*
+
+- Matches are found within a single line; a query cannot span lines.
+- Right-to-left scripts are not supported: labels are placed by byte/display
+  column and do not follow visual order.
+- Buffer text is assumed to be NFC. Text stored in another normalization form
+  is matched as-is; only the query is normalized. Compatibility folding
+  (NFKC) is left to codecs via `normalize`.
+- For a line-level codec that fuses several characters into one entry, the
+  fused entry can be reached through its ASCII `keys`, but typing the fused
+  characters literally will not match it. The query is split per character and
+  is never passed through `parse`.
+- There are only as many jumpable matches as configured labels. Additional
+  matches are highlighted but have no label.
+- Only the current tab page is searched; labels in other tabs would not be
+  visible.
+
+==============================================================================
+10. TESTS                                              *jump-tests*
+
+Run the headless test suite from the repository root: >
+
+  nvim --headless --clean -l tests/run.lua
+<
+It exits with a non-zero status when a test fails.
+
+==============================================================================
+11. LICENSE                                            *jump-license*
+
+Mozilla Public License 2.0, unless stated otherwise. See the LICENSE file in
+the repository.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

@@ -3,8 +3,8 @@
 nvim-jump is a jump plugin similar to
 [pounce](https://github.com/rlane/pounce.nvim) and
 [flash](https://github.com/folke/flash.nvim), but with a severely reduced
-feature set and as a result a tiny fraction of the code (less than 200 lines of
-code).
+feature set and a small codebase: the jump loop and codec framework are a few
+hundred lines of hand-written Lua, plus generated pinyin and Unicode tables.
 
 Usage is simple: press a key to trigger the plugin, type one or more characters
 to reduce the number of matches, then press the label to jump to it. Basically
@@ -16,6 +16,21 @@ match instead of having to hit `n` a bunch of times:
 Compared to other plugins this allows for jumping that's just as fast but
 without the mental cost of having to deal with changing labels, a hundred labels
 displayed on screen, and so on.
+
+## Fork
+
+This repository is [huayue5201/nvim-jump](https://github.com/huayue5201/nvim-jump),
+a fork of [yorickpeterse/nvim-jump](https://github.com/yorickpeterse/nvim-jump).
+It keeps the upstream behaviour and adds:
+
+- CJK matching by pinyin initial (see below)
+- Optional jumping across windows of the current tab page
+- A small codec framework for extensible non-ASCII matching
+- Unicode (NFC) normalization of the input query
+- A headless test suite
+
+Features are still deliberately few; the upstream plugin is considered complete,
+so this fork only adds what is documented here.
 
 ## Why?
 
@@ -60,15 +75,40 @@ Feature-wise this plugin is considered complete.
 
 ## Usage
 
-Install the plugin using your favorite plugin manager, then create a mapping
-(this maps the plugin to the `s` key):
+Install the plugin using your favorite plugin manager. With lazy.nvim:
+
+```lua
+{
+  'huayue5201/nvim-jump',
+  init = function()
+    vim.keymap.set({ 'n', 'x', 'o' }, 's', require('jump').start, {})
+  end,
+}
+```
+
+Or create the mapping yourself after the plugin is loaded (this maps the plugin
+to the `s` key):
 
 ```lua
 vim.keymap.set({ 'n', 'x', 'o' }, 's', require('jump').start, {})
 ```
 
-If you want to change the labels to use or the highlight groups, use the `setup`
-function:
+While jumping:
+
+- Type characters to narrow the matches. Lower-case input matches
+  case-insensitively; input containing a capital is case-sensitive.
+- Press `Backspace` (`<C-h>` also works) to delete the last input character.
+- Press a label to jump to that match.
+- Press `Enter` to jump to the match with the first available label.
+- Press `Esc` to cancel.
+
+The plugin works in normal, visual and operator-pending mode because
+`require('jump').start` is a plain function; the mapping above covers all three.
+
+The plugin calls `setup()` with the defaults when it loads, so it works without
+any configuration. To change the labels, highlight groups or codecs, call
+`setup()` before or after loading; the options you pass replace the current
+values:
 
 ```lua
 require('jump').setup({
@@ -90,7 +130,7 @@ The following settings are available (along with their defaults):
   label = 'FlashLabel',
 
   -- Jump to matches in every window of the current tab page instead of only the
-  -- current window.
+  -- current window. Floating windows are skipped, except the current window.
   multi_window = false,
 
   -- Character codecs, in order of registration. A codec either maps non-ASCII
@@ -124,9 +164,10 @@ jumping into Chinese text does not require switching to an IME:
 
 The mapping covers the 3755 GB2312 level-1 characters plus the most common
 多音字, which get one initial per reading (行 `x`/`h`, 重 `z`/`c`, 长 `c`/`z`).
-Characters outside that set are matched literally only. The table lives in
-`lua/jump/pinyin.lua` and is only loaded once a buffer actually contains CJK
-text.
+Characters outside that set are matched literally only. The GB2312 table lives
+in `lua/jump/pinyin.lua`; the additional 多音字 initials live in
+`lua/jump/codec/pinyin.lua`. The table is only loaded once a buffer actually
+contains CJK text.
 
 A single letter can match many characters, so there may be more matches than
 labels. Keep typing to narrow them down; matches without a label are still
@@ -180,9 +221,21 @@ switches to its window:
 require('jump').setup({ multi_window = true })
 ```
 
-Floating windows (hover, completion popups, …) are skipped, and other tab pages
-are not searched because their labels would not be visible. If the same buffer
-is shown in several windows, each visible part is searched independently.
+Floating windows (hover, completion popups, …) are skipped, except the current
+window, which is always searched even when it is floating. Other tab pages are
+not searched because their labels would not be visible. If the same buffer is
+shown in several windows, each visible part is searched independently. The
+match's window is selected before the cursor is moved, and the previous
+position is added to the jumplist.
+
+### Tests
+
+The repository includes a headless test suite. Run it from the repository root
+with Neovim 0.11 or newer:
+
+```sh
+nvim --headless --clean -l tests/run.lua
+```
 
 ## License
 
