@@ -75,7 +75,16 @@ Feature-wise this plugin is considered complete.
 
 ## Usage
 
-Install the plugin using your favorite plugin manager. With lazy.nvim:
+Install the plugin using your favorite plugin manager.
+
+With `vim.pack` (Neovim 0.12+):
+
+```lua
+vim.pack.add({ "https://github.com/huayue5201/nvim-jump" })
+vim.keymap.set({ 'n', 'x', 'o' }, 's', require('jump').start, {})
+```
+
+With lazy.nvim:
 
 ```lua
 {
